@@ -1,3 +1,8 @@
+> **Fork of [ledongthuc/pdf](https://github.com/ledongthuc/pdf)** with the fix of
+> [#109](https://github.com/ledongthuc/pdf/pull/109): reference cycles in a malformed PDF
+> no longer loop forever or overflow the stack. Import path `github.com/agilira/pdf`;
+> back to upstream once the fix is merged there.
+
 # PDF Reader
 
 [![Built with WeBuild](https://raw.githubusercontent.com/webuild-community/badge/master/svg/WeBuild.svg)](https://webuild.community)
