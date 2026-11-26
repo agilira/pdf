@@ -67,11 +67,14 @@ import (
 	"crypto/md5"
 	"crypto/rc4"
 	"encoding/ascii85"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
 	"strconv"
+	"sync"
+	"sync/atomic"
 )
 
 // DebugOn is responsible for logging messages into stdout. If problems arise during reading, set it true.
@@ -86,6 +89,83 @@ type Reader struct {
 	trailerptr objptr
 	key        []byte
 	useAES     bool
+
+	// decodeLimit bounds the bytes all streams decode to; decoded counts
+	// them. See SetDecodeLimit.
+	decodeLimit int64
+	decoded     atomic.Int64
+
+	// objStms are object streams already decoded, by their object, up to
+	// maxObjStmCache bytes: each object stored in one is looked up in it,
+	// and decoding it again for each would cost its size every time.
+	objStmMu    sync.Mutex
+	objStms     map[objptr][]byte
+	objStmBytes int
+}
+
+// maxObjStmCache bounds the decoded object streams a reader keeps.
+const maxObjStmCache = 64 << 20
+
+// objStmData is the decoded content of the object stream strm, kept for
+// the next lookup in it.
+func (r *Reader) objStmData(strm Value) []byte {
+	r.objStmMu.Lock()
+	data, ok := r.objStms[strm.ptr]
+	r.objStmMu.Unlock()
+	if ok {
+		return data
+	}
+	data, err := io.ReadAll(strm.Reader())
+	if err != nil {
+		panic(fmt.Errorf("reading an object stream: %v", err))
+	}
+	r.objStmMu.Lock()
+	defer r.objStmMu.Unlock()
+	if r.objStmBytes+len(data) <= maxObjStmCache {
+		if r.objStms == nil {
+			r.objStms = map[objptr][]byte{}
+		}
+		r.objStms[strm.ptr] = data
+		r.objStmBytes += len(data)
+	}
+	return data
+}
+
+// ErrDecodeLimit is the error of a stream read past the reader's decode
+// limit (SetDecodeLimit).
+var ErrDecodeLimit = errors.New("pdf: the streams decode to more than the limit set")
+
+// SetDecodeLimit bounds the bytes that all the streams read through r
+// decode to, together: a stream read past it fails with ErrDecodeLimit,
+// and so does every stream after. A few kilobytes of compressed data can
+// decode to gigabytes, and one stream can be the content of every page.
+// 0, the default, sets no limit.
+func (r *Reader) SetDecodeLimit(n int64) {
+	r.decodeLimit = n
+}
+
+// budgetReader counts what a stream decodes to against its reader's limit.
+type budgetReader struct {
+	rd  io.Reader
+	pdf *Reader
+}
+
+func (b *budgetReader) Read(p []byte) (int, error) {
+	left := b.pdf.decodeLimit - b.pdf.decoded.Load()
+	if left <= 0 {
+		// At the limit: a stream that decodes to exactly it ends here.
+		var one [1]byte
+		if n, err := b.rd.Read(one[:]); n == 0 && err != nil {
+			return 0, err
+		}
+		return 0, ErrDecodeLimit
+	}
+	if int64(len(p)) > left {
+		p = p[:left]
+	}
+	n, err := b.rd.Read(p)
+	b.pdf.decoded.Add(int64(n))
+	return n, err
 }
 
 type xref struct {
@@ -789,7 +869,7 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 				if first == 0 {
 					panic("missing First")
 				}
-				b := newBuffer(strm.Reader(), 0)
+				b := newBuffer(bytes.NewReader(r.objStmData(strm)), 0)
 				b.allowEOF = true
 				for i := 0; i < n; i++ {
 					id, _ := b.readToken().(int64)
@@ -879,7 +959,9 @@ func (v Value) Reader() io.ReadCloser {
 			rd = applyFilter(rd, filter.Index(i).Name(), param.Index(i))
 		}
 	}
-
+	if v.r.decodeLimit > 0 {
+		rd = &budgetReader{rd: rd, pdf: v.r}
+	}
 	return io.NopCloser(rd)
 }
 
